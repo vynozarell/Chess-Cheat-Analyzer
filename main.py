@@ -59,8 +59,16 @@ CACHE_DB = Path("cache.db")
 CONFIG_FILE = Path.home() / ".chess-analyzer" / "config.json"
 SF_DIR = Path.home() / ".chess-analyzer" / "engines"
 RESULTS_ROOT = Path("results")
-ANALYSIS_DEPTH = 12
+ANALYSIS_DEPTH = int(os.environ.get("CHESS_DEPTH", 14))   # deeper = fewer false "misses"
+ANALYSIS_MULTIPV = 3        # top-3 lines per position -> lets us measure move difficulty
 ENGINE_HASH_MB = 128
+
+# Anti-cheat tuning knobs ---------------------------------------------------
+OPENING_PLIES = 20          # ignore book-ish moves (everyone plays them "perfectly")
+EVAL_CAP = 700              # ignore positions already decided (+-7.00 or worse)
+EVAL_CLAMP = 1000           # clamp evals before computing centipawn loss
+GAP_CRIT = 15               # best move must beat 2nd best by >= this (cp) to count
+                            # as a real "decision point" (not an equal-moves coin flip)
 
 SF_RELEASES = {
     ("Windows", "AMD64"):  "https://github.com/official-stockfish/Stockfish/releases/download/sf_16.1/stockfish-windows-x86-64.zip",
@@ -278,7 +286,8 @@ class Game:
 
     @property
     def uid(self):
-        return hashlib.sha1(self.pgn.encode()).hexdigest()[:16]
+        tag = f"|v2|d{ANALYSIS_DEPTH}|m{ANALYSIS_MULTIPV}"
+        return hashlib.sha1((self.pgn + tag).encode()).hexdigest()[:16]
 
 
 def normalize_chesscom(games):
@@ -361,15 +370,26 @@ class Engine:
             except Exception: pass
 
     def analyse(self, board):
+        """Return [(cp_white_pov, first_move_uci), ...] best line first."""
+        def run():
+            return self._eng.analyse(board, chess.engine.Limit(depth=self.depth),
+                                     multipv=ANALYSIS_MULTIPV)
         try:
-            info = self._eng.analyse(board, chess.engine.Limit(depth=self.depth))
+            infos = run()
         except (chess.engine.EngineTerminatedError, BrokenPipeError,
                 chess.engine.EngineError):
             self._spawn()
-            info = self._eng.analyse(board, chess.engine.Limit(depth=self.depth))
-        cp = info["score"].white().score(mate_score=10000) or 0
-        pv = [m.uci() for m in (info.get("pv") or [])]
-        return cp, pv
+            infos = run()
+        if isinstance(infos, dict):
+            infos = [infos]
+        lines = []
+        for inf in infos:
+            if "score" not in inf: continue
+            cp = inf["score"].white().score(mate_score=10000)
+            pv = inf.get("pv") or []
+            lines.append((cp if cp is not None else 0,
+                          pv[0].uci() if pv else None))
+        return lines or [(0, None)]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -411,26 +431,60 @@ def analyze_game(game, engine, progress_cb=None):
     moves = list(pgn.mainline_moves())
     if not moves: return []
 
-    prev_cp, prev_pv = engine.analyse(board)
+    prev_lines = engine.analyse(board)
+    last_to = None
     md = []
     for i, mv in enumerate(moves):
         mover_white = board.turn
-        was_best = bool(prev_pv) and prev_pv[0] == mv.uci()
+        sgn = 1 if mover_white else -1
+        uci = mv.uci()
+
+        # context of the position BEFORE the move
+        n_legal = board.legal_moves.count()
+        recapture = board.is_capture(mv) and last_to is not None and mv.to_square == last_to
+        trivial = n_legal <= 3 or board.is_check() or recapture
+        rank = next((k for k, (_, m) in enumerate(prev_lines) if m == uci), None)
+        eval_before = sgn * prev_lines[0][0]
+        quiet_best = False
+        try:
+            bm = chess.Move.from_uci(prev_lines[0][1]) if prev_lines[0][1] else None
+            if bm is not None:
+                quiet_best = (not board.is_capture(bm) and not board.gives_check(bm)
+                              and bm.promotion is None)
+        except Exception:
+            pass
+        gap = (sgn * (prev_lines[0][0] - prev_lines[1][0])
+               if len(prev_lines) > 1 else None)
+
         board.push(mv)
-        cp_after, pv_after = engine.analyse(board)
-        before = prev_cp if mover_white else -prev_cp
-        after = cp_after if mover_white else -cp_after
+        last_to = mv.to_square
+        cur_lines = engine.analyse(board)
+
+        # clamp evals (like Lichess does) so one missed mate (+-10000) can't
+        # turn a single move into a 10,000 cp "loss" and wreck every average
+        before = max(-EVAL_CLAMP, min(EVAL_CLAMP, eval_before))
+        after = max(-EVAL_CLAMP, min(EVAL_CLAMP, sgn * cur_lines[0][0]))
         cpl = max(0, before - after)
         acc = move_accuracy(win_percent(before), win_percent(after))
         md.append({
             "ply": i + 1, "color": "white" if mover_white else "black",
             "cp_loss": cpl, "accuracy": acc,
-            "classification": classify(cpl), "was_best": was_best,
+            "classification": classify(cpl), "was_best": rank == 0,
             "phase": lichess_phase(i, board),
+            "rank": rank, "gap": gap, "n_legal": n_legal,
+            "trivial": trivial, "eval_before": eval_before,
+            "quiet_best": quiet_best,
         })
-        prev_cp, prev_pv = cp_after, pv_after
+        prev_lines = cur_lines
         if progress_cb: progress_cb(i + 1, len(moves))
     return md
+
+
+def _is_core(m):
+    """A move that actually tells us something about who/what chose it."""
+    return (m["ply"] > OPENING_PLIES
+            and not m.get("trivial")
+            and abs(m.get("eval_before", 0)) <= EVAL_CAP)
 
 
 def game_metrics(md, color):
@@ -452,7 +506,30 @@ def game_metrics(md, color):
             by_phase[p] = {"moves": len(sub),
                            "accuracy": round(mean(x["accuracy"] for x in sub), 1),
                            "acpl": round(mean(x["cp_loss"] for x in sub), 1)}
+    # --- "core" moves: non-book, non-forced, not-yet-decided positions ------
+    core = [m for m in pm if _is_core(m)]
+    dps = [m for m in core if m.get("gap") is not None and m["gap"] >= GAP_CRIT]
+    streak = best_streak = 0
+    for m in dps:
+        if m.get("rank") == 0:
+            streak += 1; best_streak = max(best_streak, streak)
+        else:
+            streak = 0
+    qdps = [m for m in dps if m.get("quiet_best")]
+    core_acpl = (mean(min(m["cp_loss"], 150) for m in core) if core else None)
+    core_acc = (mean(m["accuracy"] for m in core) if core else None)
+    core_near = (sum(1 for m in core if m["cp_loss"] <= 10) / len(core)
+                 if core else None)
     return {
+        "core_moves": len(core),
+        "core_acpl": round(core_acpl, 1) if core_acpl is not None else None,
+        "core_acc": round(core_acc, 1) if core_acc is not None else None,
+        "core_near_best": round(core_near, 3) if core_near is not None else None,
+        "qdp": len(qdps),
+        "qdp_top1": sum(1 for m in qdps if m.get("rank") == 0),
+        "dp": len(dps),
+        "dp_top1": sum(1 for m in dps if m.get("rank") == 0),
+        "max_streak": best_streak,
         "color": color, "moves": len(pm), "accuracy": round(acc, 1),
         "acpl": round(mean(m["cp_loss"] for m in pm), 1),
         "median_cpl": int(median(m["cp_loss"] for m in pm)),
@@ -473,14 +550,14 @@ def cache_init():
     c = sqlite3.connect(str(CACHE_DB), check_same_thread=False, timeout=30)
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
-    c.execute("""CREATE TABLE IF NOT EXISTS analysis (
+    c.execute("""CREATE TABLE IF NOT EXISTS analysis_v2 (
         uid TEXT PRIMARY KEY, move_data TEXT,
         metrics_w TEXT, metrics_b TEXT)""")
     c.commit()
     return c
 
 def cache_get(c, uid):
-    r = c.execute("SELECT move_data, metrics_w, metrics_b FROM analysis WHERE uid=?",
+    r = c.execute("SELECT move_data, metrics_w, metrics_b FROM analysis_v2 WHERE uid=?",
                   (uid,)).fetchone()
     if not r: return None
     return (json.loads(r[0]),
@@ -488,7 +565,7 @@ def cache_get(c, uid):
             json.loads(r[2]) if r[2] else None)
 
 def cache_put(c, uid, md, mw, mb):
-    c.execute("INSERT OR REPLACE INTO analysis VALUES (?,?,?,?)",
+    c.execute("INSERT OR REPLACE INTO analysis_v2 VALUES (?,?,?,?)",
               (uid, json.dumps(md), json.dumps(mw) if mw else None,
                json.dumps(mb) if mb else None))
     c.commit()
@@ -556,21 +633,47 @@ def consistency_signal(per_game):
             "max": 2.5, "std": round(sd, 2)}
 
 
-def timing_signal(games):
+def _parse_tc(tc):
+    m = re.match(r"^(\d+)(?:\+(\d+))?$", str(tc or ""))
+    return (int(m.group(1)), int(m.group(2) or 0)) if m else (None, 0)
+
+
+def player_move_times(g, username):
+    """[(ply, seconds_spent)] for ONE player's moves.
+
+    Fixes two bugs of the old code: it subtracted the opponent's clock from
+    the player's clock (clocks alternate colours), and ignored the increment.
+    """
+    color = _player_color(g, username)
+    base, inc = _parse_tc(g.time_control)
+    if not color or base is None:
+        return []
+    try:
+        pgn = chess.pgn.read_game(io.StringIO(g.pgn))
+    except Exception:
+        return []
+    if not pgn: return []
+    prev = {True: float(base), False: float(base)}
+    want_white = (color == "white")
+    out, node, ply = [], pgn, 0
+    while node.variations:
+        node = node.variations[0]; ply += 1
+        mover_white = (ply % 2 == 1)
+        clk = node.clock()
+        if clk is None: continue
+        if mover_white == want_white:
+            out.append((ply, max(0.0, prev[mover_white] - clk + inc)))
+        prev[mover_white] = clk
+    return out
+
+
+def timing_signal(games, username):
     instant = total = 0
     for g in games:
-        try:
-            pgn = chess.pgn.read_game(io.StringIO(g.pgn))
-        except Exception: continue
-        if not pgn: continue
-        node = pgn; prev = None
-        while node.variations:
-            node = node.variations[0]
-            clk = node.clock()
-            if clk is not None and prev is not None:
-                total += 1
-                if prev - clk < 1.0: instant += 1
-            prev = clk
+        for ply, spent in player_move_times(g, username):
+            if ply <= 6: continue
+            total += 1
+            if spent < 1.0: instant += 1
     if total == 0:
         return {"score": 2.9, "max": 3.5, "note": "no clock data"}
     ratio = instant / total
@@ -610,7 +713,7 @@ def compute_signals(agg, per_game, games, rating, tc, username):
     perf = performance_signal(agg, rating, tc)
     err = errors_signal(agg, rating, tc)
     cons = consistency_signal(per_game)
-    tim = timing_signal(games)
+    tim = timing_signal(games, username)
     rep = opening_repertoire_signal(games, per_game, username)
     strong = min(10.0, round(
         perf["score"] + err["score"] * 1.2 + cons["score"] +
@@ -630,171 +733,279 @@ def _player_color(g, username):
     return None
 
 
-def cheat_analysis(games, per_game, username, rating, time_class):
+def _ramp(x, lo, hi):
+    """0 at/below lo, 1 at/above hi, linear in between."""
+    return 0.0 if hi <= lo else max(0.0, min(1.0, (x - lo) / (hi - lo)))
+
+
+def _expected_top1(rating):
+    """Expected engine-top-move rate at 'clear decision points' for a human.
+    Heuristic starting point — tune on your own known-legit / known-cheater sets."""
+    return 0.45 + (min(2600, max(800, rating)) - 800) * 0.00006
+
+
+def _zscore(rate, p, n):
+    if n <= 0 or not 0 < p < 1: return 0.0
+    return (rate - p) / math.sqrt(p * (1 - p) / n)
+
+
+WEIGHTS = {
+    "Engine match":            0.15,
+    "Quiet-move match":        0.15,
+    "Raw engine strength":     0.18,
+    "Streaks & perfect games": 0.12,
+    "Selective assistance":    0.12,
+    "Results vs rating":       0.10,
+    "Clock uniformity":        0.08,
+    "Rating climb":            0.04,
+}
+# signals that can establish engine use on their own; the others only corroborate
+PRIMARY = {"Engine match", "Quiet-move match", "Raw engine strength",
+           "Streaks & perfect games", "Selective assistance"}
+
+
+def _opponent_name(g, username):
+    return g.black if _player_color(g, username) == "white" else g.white
+
+
+def _opponent_pool(games, username):
+    """Aggregate the OPPONENTS' metrics from the very same games.
+
+    They are humans of similar rating, same time control, analysed by the same
+    engine at the same depth -> a self-calibrating baseline, no guessed constants.
+    """
+    pool = {"dp": 0, "dp1": 0, "qdp": 0, "qdp1": 0, "core_n": 0, "acpl_sum": 0.0,
+            "accs": [], "games": 0}
+    for g in games:
+        c = _player_color(g, username)
+        if not c: continue
+        m = g.metrics_b if c == "white" else g.metrics_w
+        if not m: continue
+        pool["games"] += 1
+        pool["dp"] += m.get("dp", 0);   pool["dp1"] += m.get("dp_top1", 0)
+        pool["qdp"] += m.get("qdp", 0); pool["qdp1"] += m.get("qdp_top1", 0)
+        n = m.get("core_moves", 0)
+        pool["core_n"] += n
+        pool["acpl_sum"] += (m.get("core_acpl") or 0) * n
+        pool["accs"].append(m["accuracy"])
+    pool["acpl"] = pool["acpl_sum"] / pool["core_n"] if pool["core_n"] else None
+    return pool
+
+
+def _rate_signal(k_p, n_p, k_o, n_o, fallback, lo=0.08, hi=0.25):
+    """Player's match rate vs opponents' (or a heuristic fallback when there are
+    too few opponent moves). Score needs BOTH a real effect size and significance."""
+    r_p = k_p / n_p
+    if n_o >= 60:
+        base = k_o / n_o
+        pooled = (k_p + k_o) / (n_p + n_o)
+        se = math.sqrt(pooled * (1 - pooled) * (1 / n_p + 1 / n_o)) if 0 < pooled < 1 else 0
+        src_ = "opponents"
+    else:
+        base = fallback
+        se = math.sqrt(base * (1 - base) / n_p)
+        src_ = "heuristic"
+    z = (r_p - base) / se if se > 0 else 0.0
+    return _ramp(r_p - base, lo, hi) * _ramp(z, 1.5, 3.0), r_p, base, z, src_
+
+
+def cheat_analysis(games, per_game, username, rating, time_class, all_games=None):
     flags = defaultdict(list)
     scores = {}
+    meta = {"decision_points": 0, "games": 0}
 
-    if not per_game:
-        return _cheat_result(scores, flags, rating, time_class)
-
-    ba, bb, bacpl = baseline_for(rating, time_class)
     valid = [g for g in per_game if g]
     if not valid:
-        return _cheat_result(scores, flags, rating, time_class)
+        return _cheat_result(scores, flags, meta)
 
-    accs = [g["accuracy"] for g in valid]
-    bests = [g["best_move_rate"] for g in valid]
-    acpls = [g["acpl"] for g in valid]
-    mean_acc = mean(accs)
-    mean_best = mean(bests) * 100
-    mean_acpl = mean(acpls)
+    ba, bb, bacpl = baseline_for(rating, time_class)
+    meta["games"] = len(valid)
+    opp = _opponent_pool(games, username)
+    have_opp = opp["games"] >= 5 and opp["core_n"] >= 100
 
-    # A) Raw engine strength
-    a = 0.0
-    ad = mean_acc - ba
-    bd = mean_best - bb * 100
-    cd = (bacpl - mean_acpl) / bacpl * 100 if bacpl else 0
-    if ad > 8:   a += min(0.5, (ad - 8) / 15)
-    if bd > 15:  a += min(0.4, (bd - 15) / 25)
-    if cd > 25:  a += min(0.4, (cd - 25) / 40)
-    scores["Raw engine strength"] = min(1.0, a)
-    if a > 0.2:
-        flags["Raw engine strength"].append(
-            f"acc {ad:+.1f} pts, best-move {bd:+.1f} pts, ACPL {cd:+.1f}% vs peers")
+    # reference numbers: opponents when we have them, heuristics otherwise
+    ref_acpl = opp["acpl"] if have_opp and opp["acpl"] else bacpl * 1.2
+    ref_acc = mean(opp["accs"]) if have_opp else ba
+    meta["baseline"] = "opponents" if have_opp else "heuristic"
 
-    # B) Selective assistance
-    if len(accs) >= 5:
+    # ── A) Engine match on CLEAR decision points ────────────────────────────
+    dp = sum(g.get("dp", 0) for g in valid)
+    dp1 = sum(g.get("dp_top1", 0) for g in valid)
+    meta["decision_points"] = dp
+    if dp >= 25:
+        s, r, base, z, how = _rate_signal(dp1, dp, opp["dp1"], opp["dp"],
+                                          _expected_top1(rating))
+        scores["Engine match"] = s
+        if s > 0.2:
+            flags["Engine match"].append(
+                f"{r*100:.0f}% top-engine-move on {dp} decision points vs "
+                f"{base*100:.0f}% for {how} (z={z:.1f})")
+
+    # ── A2) Quiet-move match: best move is NOT a capture/check/promotion ────
+    # These are the moves humans actually miss; engines (and their users) don't.
+    qdp = sum(g.get("qdp", 0) for g in valid)
+    qdp1 = sum(g.get("qdp_top1", 0) for g in valid)
+    if qdp >= 15:
+        s, r, base, z, how = _rate_signal(qdp1, qdp, opp["qdp1"], opp["qdp"],
+                                          _expected_top1(rating) - 0.05,
+                                          lo=0.10, hi=0.30)
+        scores["Quiet-move match"] = s
+        if s > 0.2:
+            flags["Quiet-move match"].append(
+                f"{r*100:.0f}% on {qdp} quiet engine-best moves vs "
+                f"{base*100:.0f}% for {how} (z={z:.1f})")
+
+    # ── B) Raw strength on core moves ───────────────────────────────────────
+    core_n = sum(g.get("core_moves", 0) for g in valid)
+    if core_n >= 60:
+        core_acpl = (sum((g.get("core_acpl") or 0) * g.get("core_moves", 0)
+                         for g in valid) / core_n)
+        mean_acc = mean(g["accuracy"] for g in valid)
+        cd = 1 - core_acpl / ref_acpl if ref_acpl else 0
+        ad = mean_acc - ref_acc
+        scores["Raw engine strength"] = (_ramp(cd, 0.30, 0.65)
+                                         + _ramp(ad, 5, 12)) / 2
+        if scores["Raw engine strength"] > 0.2:
+            flags["Raw engine strength"].append(
+                f"core ACPL {core_acpl:.0f} vs {ref_acpl:.0f} "
+                f"({meta['baseline']}); accuracy {ad:+.1f} pts")
+
+    # ── C) Streaks & perfect games ──────────────────────────────────────────
+    if len(valid) >= 3:
+        streak = max(g.get("max_streak", 0) for g in valid)
+        perfect = [g for g in valid
+                   if g.get("dp", 0) >= 10 and g.get("core_acpl") is not None
+                   and g["dp_top1"] / g["dp"] >= 0.90
+                   and g["core_acpl"] <= max(8, 0.30 * ref_acpl)]
+        scores["Streaks & perfect games"] = max(_ramp(streak, 10, 18),
+                                                _ramp(len(perfect), 0, 3))
+        if scores["Streaks & perfect games"] > 0.2:
+            flags["Streaks & perfect games"].append(
+                f"longest run of engine-top moves: {streak}; "
+                f"{len(perfect)} near-perfect game(s)")
+
+    # ── D) Selective assistance ─────────────────────────────────────────────
+    if len(valid) >= 5:
+        accs = [g["accuracy"] for g in valid]
         sd = pstdev(accs)
-        above = sum(1 for x in accs if x > ba + 10)
-        frac_above = above / len(accs)
+        low = [g for g in valid if g.get("core_acpl") is not None
+               and g.get("core_moves", 0) >= 15 and g["core_acpl"] <= 0.4 * ref_acpl]
+        frac_low = len(low) / len(valid)
         top_n = max(1, len(accs) // 5)
         top_mean = mean(sorted(accs, reverse=True)[:top_n])
-        b = 0.0
-        if frac_above >= 0.3:
-            b += min(0.6, (frac_above - 0.3) / 0.4)
-        if top_mean - ba > 15:
-            b += min(0.5, (top_mean - ba - 15) / 20)
-        if sd < 3.0 and mean_acc > ba + 3:
-            b += 0.3
-        scores["Selective assistance"] = min(1.0, b)
-        if b > 0.2:
+        steady = 1.0 if (sd < 3.0 and mean(accs) > ref_acc + 3) else 0.0
+        scores["Selective assistance"] = min(
+            1.0, 0.40 * _ramp(frac_low, 0.10, 0.40)
+               + 0.35 * _ramp(top_mean - ref_acc, 10, 20)
+               + 0.25 * steady)
+        if scores["Selective assistance"] > 0.2:
             flags["Selective assistance"].append(
-                f"{above}/{len(accs)} games ≥{ba+10:.0f}%; top-quintile avg "
-                f"{top_mean:.1f}%; σ={sd:.1f}")
+                f"{len(low)}/{len(valid)} games at engine-like ACPL; "
+                f"top-quintile accuracy {top_mean:.1f}%; σ={sd:.1f}")
 
-    # C) Cosmetic blunders
-    cosmetic = total_bl = 0
+    # ── E) Clock uniformity, judged against the opponents' own clock habits ─
+    def _cv(times):
+        return stdev(times) / mean(times) if len(times) >= 40 and mean(times) > 0 else None
+    t_p, t_o = [], []
     for g in games:
-        color = _player_color(g, username)
-        if not color: continue
-        for m in g.move_data:
-            if m["color"] != color: continue
-            if m["classification"] == "blunder":
-                total_bl += 1
-                if m["cp_loss"] < 450:
-                    cosmetic += 1
-    if total_bl >= 4:
-        ratio = cosmetic / total_bl
-        c = max(0.0, (ratio - 0.65) / 0.30)
-        scores["Cosmetic blunders"] = min(1.0, c)
-        if c > 0.2:
-            flags["Cosmetic blunders"].append(
-                f"{cosmetic}/{total_bl} blunders in 300-450 CPL range "
-                f"({ratio*100:.0f}%)")
-
-    # D) Tactical precision
-    sharp_best = sharp_tot = 0
-    for g in games:
-        color = _player_color(g, username)
-        if not color: continue
-        for m in g.move_data:
-            if m["color"] != color: continue
-            if m["phase"] in ("middlegame", "endgame"):
-                sharp_tot += 1
-                if m["was_best"]:
-                    sharp_best += 1
-    if sharp_tot > 30:
-        rate = sharp_best / sharp_tot
-        d = max(0.0, (rate - 0.55) / 0.25)
-        scores["Tactical precision"] = min(1.0, d)
-        if d > 0.2:
-            flags["Tactical precision"].append(
-                f"{rate*100:.1f}% engine top-choice in mid+endgame "
-                f"(typical: 35-50%)")
-
-    # E) Clock uniformity
-    times = []
-    for g in games:
-        try:
-            pgn = chess.pgn.read_game(io.StringIO(g.pgn))
-        except Exception: continue
-        if not pgn: continue
-        node = pgn; prev = None
-        while node.variations:
-            node = node.variations[0]
-            clk = node.clock()
-            if clk is not None and prev is not None:
-                spent = prev - clk
-                if 0 <= spent < 600:
-                    times.append(spent)
-            prev = clk
-    if len(times) >= 30:
-        mu = mean(times); sd = stdev(times)
-        cv = sd / mu if mu > 0 else 0
-        e = max(0.0, (0.35 - cv) / 0.35)
-        scores["Clock uniformity"] = min(1.0, e)
-        if e > 0.2:
+        t_p += [s for ply, s in player_move_times(g, username) if ply > 10 and s < 600]
+        t_o += [s for ply, s in player_move_times(g, _opponent_name(g, username))
+                if ply > 10 and s < 600]
+    cv_p, cv_o = _cv(t_p), _cv(t_o)
+    if cv_p is not None:
+        absolute = _ramp(0.80 - cv_p, 0.0, 0.40)
+        if cv_o:
+            rel = _ramp(1 - cv_p / cv_o, 0.15, 0.55)
+            scores["Clock uniformity"] = min(absolute, rel)
+        else:
+            scores["Clock uniformity"] = absolute
+        if scores["Clock uniformity"] > 0.2:
             flags["Clock uniformity"].append(
-                f"think-time CV {cv:.2f} (humans > 0.8) — very uniform")
+                f"think-time CV {cv_p:.2f}"
+                + (f" vs {cv_o:.2f} for opponents" if cv_o else " (humans usually > 0.8)"))
 
-    # F) Rating gap
-    implied_rating = rating + (bacpl - mean_acpl) * 4
-    gap = implied_rating - rating
-    f = max(0.0, min(1.0, (gap - 150) / 400))
-    scores["Rating gap"] = f
-    if f > 0.1:
-        flags["Rating gap"].append(
-            f"skill implies ~{int(implied_rating)} but rated {rating} "
-            f"(gap {gap:+.0f})")
+    # ── F/G) Results vs rating + rating climb (no engine needed, all games) ─
+    pool = [g for g in (all_games if all_games is not None else games)
+            if _player_color(g, username)]
+    exp_sum = act = var = 0.0
+    n_res = 0
+    for g in pool:
+        c = _player_color(g, username)
+        me = g.white_rating if c == "white" else g.black_rating
+        op = g.black_rating if c == "white" else g.white_rating
+        if not (g.rated and me > 0 and op > 0): continue
+        oc = outcome_for(g, c)
+        if oc not in ("win", "draw", "loss"): continue
+        e = 1 / (1 + 10 ** ((op - me) / 400))
+        exp_sum += e; var += e * (1 - e); n_res += 1
+        act += 1.0 if oc == "win" else 0.5 if oc == "draw" else 0.0
+    if n_res >= 15 and var > 0:
+        z = (act - exp_sum) / math.sqrt(var)
+        over = (act - exp_sum) / n_res
+        scores["Results vs rating"] = min(_ramp(z, 2.0, 4.0), _ramp(over, 0.08, 0.20))
+        if scores["Results vs rating"] > 0.2:
+            flags["Results vs rating"].append(
+                f"scored {act:.1f}/{n_res} vs {exp_sum:.1f} expected (z={z:.1f})")
 
-    return _cheat_result(scores, flags, rating, time_class)
+    same_tc = sorted((g for g in pool if g.time_class == time_class and g.rated),
+                     key=lambda g: g.end_time)
+    rs = [(g.white_rating if _player_color(g, username) == "white" else g.black_rating)
+          for g in same_tc]
+    rs = [r for r in rs if r > 0]
+    if len(rs) >= 12:
+        delta = mean(rs[-4:]) - mean(rs[:4])
+        scores["Rating climb"] = _ramp(delta, 80, 250)
+        if scores["Rating climb"] > 0.2:
+            flags["Rating climb"].append(
+                f"{delta:+.0f} rating over {len(rs)} {time_class} games")
+
+    return _cheat_result(scores, flags, meta)
 
 
-def _cheat_result(scores, flags, rating, tc):
+def _cheat_result(scores, flags, meta):
+    dp, n_games = meta.get("decision_points", 0), meta.get("games", 0)
     if not scores:
-        return {"classification": "Legit", "confidence": "Low",
+        return {"classification": "Inconclusive", "confidence": "Low",
                 "severity": 0.0, "scores": {}, "strong_flags": [],
-                "signals": [], "detail": {}}
+                "signals": [], "detail": {}, "meta": meta}
 
-    weights = {
-        "Raw engine strength":   0.25,
-        "Selective assistance":  0.30,
-        "Cosmetic blunders":     0.15,
-        "Tactical precision":    0.15,
-        "Clock uniformity":      0.10,
-        "Rating gap":            0.05,
-    }
-    total_w = sum(weights.get(k, 0.1) for k in scores)
-    severity = sum(scores[k] * weights.get(k, 0.1) for k in scores) / total_w
+    total_w = sum(WEIGHTS.get(k, 0.05) for k in scores)
+    weighted = sum(v * WEIGHTS.get(k, 0.05) for k, v in scores.items()) / total_w
 
-    strong_flags = [k for k, v in scores.items() if v >= 0.3]
+    # A weighted AVERAGE lets one loud signal get drowned by quiet ones, which is
+    # exactly how real cheaters slipped through. Escalate on the strongest ones.
+    ranked = sorted(scores.values(), reverse=True)
+    t1 = ranked[0]
+    t2 = ranked[1] if len(ranked) > 1 else 0.0
+    severity = max(weighted, 0.70 * t1, 0.45 * (t1 + t2))
 
-    if severity >= 0.60 or len(strong_flags) >= 3:
+    primary_hi = max((v for k, v in scores.items() if k in PRIMARY), default=0.0)
+    corroborated = sum(1 for v in scores.values() if v >= 0.4)
+
+    if (primary_hi >= 0.60 and corroborated >= 2) or severity >= 0.65:
         cls = "Likely Cheater"
-    elif severity >= 0.30 or len(strong_flags) >= 2:
+    elif primary_hi >= 0.35 or severity >= 0.25 or corroborated >= 2:
         cls = "Maybe Cheater"
     else:
         cls = "Legit"
 
-    if len(scores) >= 5:  conf = "High"
-    elif len(scores) >= 3: conf = "Medium"
-    else:                 conf = "Low"
+    thin = dp < 60 or n_games < 5
+    if cls == "Legit" and thin:
+        cls = "Inconclusive"       # don't call someone clean on almost no evidence
+
+    if dp >= 200 and n_games >= 20:   conf = "High"
+    elif dp >= 50 and n_games >= 8:   conf = "Medium"
+    else:                             conf = "Low"
+
+    if cls == "Likely Cheater" and conf == "Low":
+        cls = "Maybe Cheater"      # never convict on a thin sample
 
     return {"classification": cls, "confidence": conf,
             "severity": round(severity, 2),
             "scores": {k: round(v, 2) for k, v in scores.items()},
-            "strong_flags": strong_flags,
-            "signals": list(scores.keys()), "detail": dict(flags)}
+            "strong_flags": [k for k, v in scores.items() if v >= 0.3],
+            "signals": list(scores.keys()), "detail": dict(flags),
+            "meta": meta}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -806,14 +1017,24 @@ def verdict(agg, rating, tc):
     implied = int(round(rating + d * 25))
     n = agg["moves"]
     conf = "Low" if n < 150 else "Medium" if n < 400 else "High"
-    if abs(d) < 1.5:
+    if d >= 8:
+        note = (f"Accuracy sits +{d:.1f} pts above the {tc} norm — far beyond what is "
+                f"typical for this rating. Check the anti-cheat breakdown.")
+        color = "red"
+    elif d >= 4:
+        note = f"Accuracy sits +{d:.1f} pts above the {tc} norm — notably strong for this rating."
+        color = "yellow"
+    elif abs(d) < 1.5:
         note = f"Accuracy at the {tc} norm for this rating — normal range."
+        color = "green"
     elif d > 0:
         note = f"Accuracy sits +{d:.1f} pts above the {tc} norm — within normal range."
+        color = "green"
     else:
         note = f"Accuracy sits {d:.1f} pts below the {tc} norm."
+        color = "green"
     return {"plays_like": implied, "confidence": conf, "moves": n,
-            "note": note, "delta": round(d, 1)}
+            "note": note, "delta": round(d, 1), "color": color}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -843,7 +1064,7 @@ def ask_inputs():
     else:
         n = IntPrompt.ask("[bold]Max games to fetch[/]", default=cfg.get("max_fetch", 40))
     max_games = IntPrompt.ask("[bold]Games to analyze (Stockfish)[/]",
-                              default=cfg.get("max_games", 15))
+                              default=cfg.get("max_games", 30))
     cfg.update({"site": site, "username": username, "months": n,
                 "max_fetch": n, "max_games": max_games})
     save_config(cfg)
@@ -862,26 +1083,31 @@ def signal_color(score, mx):
 
 def print_verdict_panel(v, sig, cheat):
     t = Text()
-    t.append(f"Plays like a genuine ~{v['plays_like']}.\n", style="bold green")
+    vc = v.get("color", "green")
+    t.append(f"Plays like ~{v['plays_like']}.\n", style=f"bold {vc}")
     t.append(v["note"] + "\n", style="white")
     t.append(f"● {v['confidence']} confidence · {v['moves']} moves analyzed",
              style="dim cyan")
-    console.print(Panel(t, title="[bold green]PERFORMANCE VERDICT[/]",
-                        border_style="green"))
+    console.print(Panel(t, title=f"[bold {vc}]PERFORMANCE VERDICT[/]",
+                        border_style=vc))
     console.print()
 
     cls = cheat["classification"]
     if cls == "Likely Cheater":   color, icon = "red", "⛔"
     elif cls == "Maybe Cheater":  color, icon = "yellow", "⚠"
+    elif cls == "Inconclusive":   color, icon = "cyan", "?"
     else:                         color, icon = "green", "✓"
 
     body = Text()
     body.append(f"{icon} {cls}\n", style=f"bold {color}")
     body.append(f"severity {cheat['severity']:.2f}  ·  "
-                f"{cheat['confidence']} confidence\n", style="dim")
+                f"{cheat['confidence']} confidence · "
+                f"{cheat.get('meta', {}).get('decision_points', 0)} decision points\n",
+                style="dim")
     if cheat.get("strong_flags"):
         body.append("Flagged: ", style="bold")
         body.append(", ".join(cheat["strong_flags"]), style=f"bold {color}")
+    body.append("\nStatistical indicator, not proof — always review the games.", style="dim")
     console.print(Panel(body, title="[bold]ANTI-CHEAT[/]", border_style=color))
     console.print()
 
@@ -1063,7 +1289,10 @@ def aggregate(per_game):
     if not valid:
         return {"moves": 0, "accuracy": 0, "acpl": 0, "best_move_rate": 0,
                 "blunder_rate": 0, "blunders": 0, "mistakes": 0,
-                "inaccuracies": 0, "best_moves": 0, "by_phase": {}}
+                "inaccuracies": 0, "best_moves": 0, "by_phase": {},
+                "core_moves": 0, "core_acpl": None, "dp": 0, "dp_top1": 0,
+                "qdp": 0, "qdp_top1": 0,
+                "max_streak": 0}
     tot = sum(m["moves"] for m in valid)
     def wavg(k): return sum(m[k] * m["moves"] for m in valid) / tot
     phases = {}
@@ -1075,7 +1304,17 @@ def aggregate(per_game):
             phases[p] = {"moves": t,
                          "accuracy": round(sum(x[0]["accuracy"] * x[1] for x in pm) / t, 1),
                          "acpl": round(sum(x[0]["acpl"] * x[1] for x in pm) / t, 1)}
-    return {"moves": tot, "accuracy": round(wavg("accuracy"), 1),
+    core_n = sum(m.get("core_moves", 0) for m in valid)
+    core_acpl = (sum((m.get("core_acpl") or 0) * m.get("core_moves", 0)
+                     for m in valid) / core_n) if core_n else None
+    return {"core_moves": core_n,
+            "core_acpl": round(core_acpl, 1) if core_acpl is not None else None,
+            "qdp": sum(m.get("qdp", 0) for m in valid),
+            "qdp_top1": sum(m.get("qdp_top1", 0) for m in valid),
+            "dp": sum(m.get("dp", 0) for m in valid),
+            "dp_top1": sum(m.get("dp_top1", 0) for m in valid),
+            "max_streak": max((m.get("max_streak", 0) for m in valid), default=0),
+            "moves": tot, "accuracy": round(wavg("accuracy"), 1),
             "acpl": round(wavg("acpl"), 1),
             "median_cpl": int(median([m["median_cpl"] for m in valid])),
             "best_move_rate": round(wavg("best_move_rate"), 3),
@@ -1264,7 +1503,7 @@ img { width:100%; border-radius:10px; margin-top:8px; }
 <div class="card verdict">
   <div class="circle"><span>$strong_score</span></div>
   <div>
-    <h1 style="color:var(--green);">Plays like a genuine ~$plays_like.</h1>
+    <h1 style="color:var(--$verdict_color);">Plays like ~$plays_like.</h1>
     <div>$verdict_note</div>
     <div class="dim" style="margin-top:6px;">● $confidence confidence · $n_moves moves across $n_games $time_class games</div>
   </div>
@@ -1358,6 +1597,7 @@ def write_html(username, site, games, per_game, agg, sig, verd, cheat, rating,
     cls = cheat["classification"]
     if cls == "Likely Cheater":   cheat_color, icon = "red", "⛔"
     elif cls == "Maybe Cheater":  cheat_color, icon = "yellow", "⚠"
+    elif cls == "Inconclusive":   cheat_color, icon = "cyan", "?"
     else:                         cheat_color, icon = "green", "✓"
 
     if cheat.get("strong_flags"):
@@ -1391,7 +1631,7 @@ def write_html(username, site, games, per_game, agg, sig, verd, cheat, rating,
         acc=f"{agg['accuracy']:.1f}%", winrate=winrate, best_rate=best_rate,
         acpl=f"{agg['acpl']:.1f}", rating=rating, n_moves=agg["moves"],
         plays_like=verd["plays_like"], confidence=verd["confidence"],
-        verdict_note=verd["note"],
+        verdict_note=verd["note"], verdict_color=verd.get("color", "green"),
         circle_pct=int(sig["strong"]["score"] / sig["strong"]["max"] * 100)
                    if sig["strong"]["max"] else 0,
         strong_score=f"{sig['strong']['score']:.1f}",
@@ -1435,10 +1675,13 @@ def main():
 
     games = [g for g in games if pick_color(g, username)]
     games.sort(key=lambda g: g.end_time, reverse=True)
+    all_games = list(games)          # full history -> results/rating signals
     games = games[:max_games]
     console.print(f"[green]✓[/] Fetched [bold]{len(games)}[/] games\n")
     if not games:
         console.print("[red]No games found.[/]"); return
+    if len(games) < 20:
+        console.print("[yellow]⚠ IMPORTANT: YOU NEED MORE THAN 30+ TO MAKE THE RESULT MORE ACCURATE !!.[/]\n")
 
     cache = cache_init()
     cached, fresh = [], []
@@ -1496,7 +1739,8 @@ def main():
 
     sig = compute_signals(agg, per_game, games, avg_rating, tc, username)
     v = verdict(agg, avg_rating, tc)
-    cheat = cheat_analysis(games, per_game, username, avg_rating, tc)
+    cheat = cheat_analysis(games, per_game, username, avg_rating, tc,
+                           all_games=all_games)
 
     console.rule("[bold cyan]REPORT[/]"); console.print()
     print_profile_summary(agg, per_game, username); console.print()
