@@ -45,8 +45,8 @@ I got tired of checking games by hand and guessing whether someone was cheating,
 **Requirements:** Python 3.9 or newer.
 
 ```bash
-git clone <your-repo-url>
-cd <your-repo-folder>
+git clone https://github.com/vynozarell/Chess-Cheat-Analyzer/
+cd Chess-Cheat-Analyzer
 
 # optional but recommended: use a virtual environment
 python -m venv .venv
@@ -105,7 +105,7 @@ Games to analyze (Stockfish) [15]:
 Everything is written to `results/<username>_<site>/`:
 
 ```text
-results/
+results/ (sorry hikaru)
 └── hikaru_chesscom/
     ├── hikaru_profile.html    ← open this one in a browser
     ├── hikaru_profile.png     ← 4-panel chart
