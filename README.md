@@ -9,7 +9,7 @@ Pull a player's recent games from **Chess.com** or **Lichess**, run every move t
 I got tired of checking games by hand and guessing whether someone was cheating, so I automated it.
 
 > ⚠️ **This is a heuristic, not proof.** See [Limitations & responsible use](#limitations--responsible-use) before drawing conclusions about anyone.
-
+- [Vynozarell Website](https://vynozarell.ct.ws/)
 ---
 
 ## Table of contents
