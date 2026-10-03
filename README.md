@@ -10,6 +10,7 @@ I got tired of checking games by hand and guessing whether someone was cheating,
 
 > ⚠️ **This is a heuristic, not proof.** See [Limitations & responsible use](#limitations--responsible-use) before drawing conclusions about anyone.
 - [Vynozarell Website](https://vynozarell.ct.ws/)
+- [Gunslol Website](https://guns.lol/vynozarell)
 ---
 
 ## Table of contents
