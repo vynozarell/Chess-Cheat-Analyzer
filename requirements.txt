@@ -1,0 +1,5 @@
+chess>=1.10.0
+requests>=2.31.0
+rich>=13.7.0
+matplotlib>=3.7.0
+stockfish>=3.28.0
