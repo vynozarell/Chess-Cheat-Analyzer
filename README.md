@@ -53,7 +53,7 @@ python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
 pip install -r requirements.txt
-python anticheat_chess.py
+python main.py
 ```
 
 Stockfish is downloaded automatically on first run. To use your own copy instead:
@@ -73,7 +73,7 @@ $env:STOCKFISH_PATH = "C:\path\to\stockfish.exe"
 Run the script and answer the prompts:
 
 ```bash
-python anticheat_chess.py
+python main.py
 ```
 
 | Prompt | Meaning |
@@ -119,7 +119,7 @@ The HTML report is fully self-contained (the chart is embedded as base64), so yo
 
 ## Configuration
 
-Two constants at the top of `anticheat_chess.py` control the speed/accuracy trade-off:
+Two constants at the top of `main.py` control the speed/accuracy trade-off:
 
 ```python
 ANALYSIS_DEPTH = 12     # higher = more accurate but slower
